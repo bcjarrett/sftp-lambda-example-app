@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SFTP Transfer Server with Lambda Decryption of Uploads
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email Account to Alert
+
+  UserName:
+    Type: String
+    Description: Name of the SFTP user
+
+  SshPublicKey:
+    Type: String
+    Description: SSH public key for the SFTP user
+
+Resources:
+  EncryptedS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-encrypted"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  DecryptedS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-decrypted"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  TransferServer:
+    Type: AWS::Transfer::Server
+    Properties:
+      IdentityProviderType: SERVICE_MANAGED
+      EndpointType: PUBLIC
+      Domain: S3
+      Protocols:
+        - SFTP
+
+  SFTPRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-SFTPRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SFTPAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${EncryptedS3Bucket}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${EncryptedS3Bucket}/home/${UserName}/*"
+
+  TransferUser:
+    Type: AWS::Transfer::User
+    Properties:
+      ServerId: !GetAtt TransferServer.ServerId
+      UserName: !Ref UserName
+      Role: !GetAtt SFTPRole.Arn
+      HomeDirectory: !Sub "/${EncryptedS3Bucket}/home/${UserName}"
+      SshPublicKeys:
+        - !Ref SshPublicKey
+
+  DecryptLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-DecryptLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole  # Cloudwatch Logging Permissions
+      Policies:
+        - PolicyName: LambdaS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${EncryptedS3Bucket}"
+                  - !Sub "arn:aws:s3:::${DecryptedS3Bucket}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${EncryptedS3Bucket}/*"
+                  - !Sub "arn:aws:s3:::${DecryptedS3Bucket}/*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !GetAtt SuccessSNS.TopicArn
+                  - !GetAtt FailureSNS.TopicArn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: "*"
+
+  DecryptFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-DecryptFunction"
+      CodeUri: app/
+      Handler: main.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt DecryptLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref EncryptedS3Bucket
+          DESTINATION_BUCKET: !Ref DecryptedS3Bucket
+      EventInvokeConfig:
+        DestinationConfig:
+          OnSuccess:
+            Type: SNS
+            Destination: !GetAtt SuccessSNS.TopicArn
+          OnFailure:
+            Type: SNS
+            Destination: !GetAtt FailureSNS.TopicArn
+
+  LambdaInvokePermissionForEventBridge:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DecryptFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3UploadEventBridgeRule.Arn
+
+  S3UploadEventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-S3UploadEventRule"
+      Description: "EventBridge rule to trigger Lambda function when a file is uploaded to the encrypted S3 bucket"
+      EventPattern:
+        source:
+          - "aws.s3"
+        detail-type:
+          - "Object Created"
+        detail:
+          bucket:
+            name:
+              - !Ref EncryptedS3Bucket
+      Targets:
+        - Arn: !GetAtt DecryptFunction.Arn
+          Id: "DecryptFunction"
+
+  SuccessSNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-DecryptSuccessTopic"
+
+  FailureSNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-DecryptFailureTopic"
+
+  SuccessSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SuccessSNS
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  FailureSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref FailureSNS
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+Outputs:
+  TransferServerEndpoint:
+    Description: "The endpoint URI of the Transfer Server"
+    Value: !Join [ '', [ !Select [ 1, !Split [ '/', !Ref TransferServer ] ], ".server.transfer.", !Ref "AWS::Region", ".amazonaws.com" ] ]
